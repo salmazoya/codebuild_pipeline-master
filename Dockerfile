@@ -15,3 +15,5 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Set the entry point and handler correctly
 ENTRYPOINT ["/var/lang/bin/python3.9", "-m", "awslambdaric"]
 CMD ["lambda_function.lambda_handler"]
+
+#running test 1
