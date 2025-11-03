@@ -12,9 +12,9 @@ logger = logging.getLogger()
 logger.setLevel(logging.INFO)
 
 # Environment Variables (Configured in Lambda)
-S3_BUCKET_NAME = os.getenv('S3_BUCKET_NAME', 'pvh-kareem')
+S3_BUCKET_NAME = os.getenv('S3_BUCKET_NAME', 'docker-slm')
 S3_FOLDER_PATH = os.getenv('S3_FOLDER_PATH', 'calendly/')
-SECRET_NAME = os.getenv('CALENDLY_SECRET_NAME', 'calendly-api-key')
+SECRET_NAME = os.getenv('CALENDLY_SECRET_NAME', 'calendly_api_key')
 REGION_NAME = os.getenv('AWS_REGION', 'us-east-1')
 
 # Initialize AWS Clients
@@ -32,7 +32,11 @@ def get_calendly_api_key():
     try:
         response = secrets_client.get_secret_value(SecretId=SECRET_NAME)
         secret = json.loads(response['SecretString'])
-        return secret.get('calendly-api-key')
+
+        # If your secret key is not fixed (like token_oct28), pick the first value
+        api_key = list(secret.values())[0]
+        logger.info("Successfully fetched Calendly API key from Secrets Manager.")
+        return api_key
     except Exception as e:
         logger.error(f"Error fetching API key from Secrets Manager: {e}")
         raise
@@ -83,8 +87,10 @@ def get_event_types(api_key, org_uri):
         logger.error(f"Error fetching event types: {response.status_code}, {response.text}")
         return []
 
+from datetime import datetime, timedelta
 
 def fetch_calendly_scheduled_calls(api_key):
+    """Fetch all Calendly scheduled events (past 30 days + next 7 days)."""
     org_uri = get_calendly_org_uri(api_key)
     if not org_uri:
         logger.error("Failed to retrieve Calendly organization URI. Cannot proceed.")
@@ -96,42 +102,90 @@ def fetch_calendly_scheduled_calls(api_key):
         return pd.DataFrame()
 
     all_events = []
+    headers = {"Authorization": f"Bearer {api_key}"}
+
+    # Date filters
+    start_date = (datetime.utcnow() - timedelta(days=90)).isoformat() + "Z"
+    end_date = (datetime.utcnow() + timedelta(days=7)).isoformat() + "Z"
 
     for event_type in event_types:
-        url = f"https://api.calendly.com/scheduled_events?event_type={event_type}&organization={org_uri}"
-        headers = {"Authorization": f"Bearer {api_key}"}
+        for status in ["active", "canceled"]:
+            url = (
+                f"https://api.calendly.com/scheduled_events"
+                f"?event_type={event_type}&organization={org_uri}"
+                f"&status={status}&min_start_time={start_date}&max_start_time={end_date}&count=100"
+            )
 
-        response = requests.get(url, headers=headers)
-        if response.status_code == 200:
-            data = response.json()
-            for event in data.get("collection", []):
-                all_events.append({
-                    "event_id": event.get("uri", ""),
-                    "event_type": event.get("event_type", ""),
-                    "start_time": event.get("start_time", ""),
-                    "end_time": event.get("end_time", ""),
-                    "status": event.get("status", "N/A"),
-                    "invitee_email": event.get("location", {}).get("email", "N/A")
-                })
-        else:
-            logger.error(f"Error fetching events for type {event_type}: {response.status_code}, {response.text}")
+            while url:
+                response = requests.get(url, headers=headers)
+
+                if response.status_code == 200:
+                    data = response.json()
+                    events = data.get("collection", [])
+
+                    for event in events:
+                        all_events.append({
+                            "event_id": event.get("uri", ""),
+                            "event_type": event.get("event_type", ""),
+                            "start_time": event.get("start_time", ""),
+                            "end_time": event.get("end_time", ""),
+                            "status": event.get("event_status", status),
+                            "invitee_email": event.get("location", {}).get("email", "N/A")
+                        })
+
+                    # Handle pagination
+                    url = data.get("pagination", {}).get("next_page", None)
+                else:
+                    logger.error(f"Error fetching events for {status} type {event_type}: {response.status_code}, {response.text}")
+                    break
+
+    if not all_events:
+        logger.warning("No scheduled events found in Calendly API response.")
+    else:
+        logger.info(f"Total events fetched: {len(all_events)}")
 
     return pd.DataFrame(all_events)
 
 
+
+
 def calculate_metrics(calendly_df):
+    """Calculate detailed metrics for all Calendly event statuses."""
+    if calendly_df.empty:
+        logger.warning("No events found for metrics calculation.")
+        return pd.DataFrame()
+
     total_scheduled_calls = len(calendly_df)
-    completed_calls = calendly_df[calendly_df["status"] == "completed"].shape[0]
-    completed_calls_percentage = (completed_calls / total_scheduled_calls) * 100 if total_scheduled_calls > 0 else 0
+
+    # Count by status type
+    status_counts = calendly_df["status"].value_counts().to_dict()
+
+    # Common keys we care about
+    completed_calls = status_counts.get("active", 0) + status_counts.get("completed", 0)
+    canceled_calls = status_counts.get("canceled", 0)
+    no_show_calls = status_counts.get("no_show", 0)
+    deleted_calls = status_counts.get("deleted", 0)
+
+    # Calculate percentages safely
+    def pct(value):
+        return round((value / total_scheduled_calls) * 100, 2) if total_scheduled_calls > 0 else 0
 
     metrics_data = {
         "timestamp": [timestamp],
         "total_scheduled_calls": [total_scheduled_calls],
         "completed_calls": [completed_calls],
-        "completed_calls_percentage": [round(completed_calls_percentage, 2)]
+        "canceled_calls": [canceled_calls],
+        "no_show_calls": [no_show_calls],
+        "deleted_calls": [deleted_calls],
+        "completed_percentage": [pct(completed_calls)],
+        "canceled_percentage": [pct(canceled_calls)],
+        "no_show_percentage": [pct(no_show_calls)],
+        "deleted_percentage": [pct(deleted_calls)]
     }
 
+    logger.info(f"Metrics calculated: {metrics_data}")
     return pd.DataFrame(metrics_data)
+
 
 
 def lambda_handler(event, context):
